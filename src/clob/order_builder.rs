@@ -573,9 +573,20 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
 
         let raw_amount = amount.as_inner();
 
+        // The CLOB server enforces a flat 4-decimal cap on derived amounts in market orders,
+        // regardless of tick size. Observed empirically 2026-06-12 on a tick=0.001 market:
+        //   400 "invalid amounts, the market buy orders maker amount supports a max accuracy
+        //   of 2 decimals, taker amount a max of 4 decimals".
+        // On tick=0.01 markets decimals+LOT_SIZE_SCALE = 2+2 = 4, so the .min(4) is a no-op
+        // there.  On tick=0.001 markets it clamps 3+2=5 → 4, matching the server constraint.
+        const SERVER_MARKET_TAKER_MAX_DECIMALS: u32 = 4;
+
         let (taker_amount, maker_amount) = match (side, amount.0) {
             (Side::Buy, AmountInner::Usdc(_)) => {
-                let shares = (raw_amount / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                // taker = derived share count; server enforces max 4dp
+                let taker_scale =
+                    (decimals + LOT_SIZE_SCALE).min(SERVER_MARKET_TAKER_MAX_DECIMALS);
+                let shares = (raw_amount / price).trunc_with_scale(taker_scale);
                 (shares, raw_amount)
             }
             (Side::Buy, AmountInner::Shares(_)) => {
@@ -583,7 +594,11 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
                 (raw_amount, usdc)
             }
             (Side::Sell, AmountInner::Shares(_)) => {
-                let usdc = (raw_amount * price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+                // taker = derived USDC out; truncating down is safe (more permissive limit)
+                // and protects tick=0.001 sells from the same server 4dp cap.
+                let taker_scale =
+                    (decimals + LOT_SIZE_SCALE).min(SERVER_MARKET_TAKER_MAX_DECIMALS);
+                let usdc = (raw_amount * price).trunc_with_scale(taker_scale);
                 (usdc, raw_amount)
             }
             (Side::Sell, AmountInner::Usdc(_)) => {
@@ -721,5 +736,54 @@ mod tests {
         let masked_salt = to_ieee_754_int(raw_salt);
 
         assert!(masked_salt < (1 << 53));
+    }
+
+    /// Regression test for market-buy taker amount on a tick=0.001 market.
+    ///
+    /// Server rule: taker amount for market orders is capped at 4 decimal places.
+    /// Observed 400 error 2026-06-12: "invalid amounts … taker amount a max of 4 decimals"
+    /// when `decimals + LOT_SIZE_SCALE` = 3 + 2 = 5 produced a 5dp share count.
+    ///
+    /// Input: amount=4.60 USDC, price=0.99, tick=0.001 (decimals=3).
+    /// Before fix: (4.60 / 0.99).trunc_with_scale(5) = 4.64646 → rejected by server.
+    /// After fix:  (4.60 / 0.99).trunc_with_scale(4) = 4.6464 → accepted.
+    #[test]
+    fn market_buy_taker_capped_at_4dp_on_tick_001_market() {
+        let raw_amount = dec!(4.60);
+        let price = dec!(0.99);
+        // tick=0.001 → decimals = scale of 0.001 = 3
+        let tick_size = dec!(0.001);
+        let decimals = tick_size.scale(); // 3
+        assert_eq!(decimals, 3);
+
+        // Before fix: would use decimals + LOT_SIZE_SCALE = 5 → 5dp result
+        let uncapped = (raw_amount / price).trunc_with_scale(decimals + LOT_SIZE_SCALE);
+        assert_eq!(uncapped, dec!(4.64646), "uncapped 5dp baseline should be 4.64646");
+
+        // After fix: .min(4) clamps to 4dp → 4.6464
+        let capped_scale = (decimals + LOT_SIZE_SCALE).min(4);
+        assert_eq!(capped_scale, 4);
+        let taker = (raw_amount / price).trunc_with_scale(capped_scale);
+        assert_eq!(taker, dec!(4.6464), "capped taker should be 4.6464 (4dp)");
+    }
+
+    /// On tick=0.01 markets the cap is a no-op: decimals=2, 2+2=4, min(4)=4.
+    #[test]
+    fn market_buy_taker_cap_is_noop_on_tick_01_market() {
+        let raw_amount = dec!(4.60);
+        let price = dec!(0.99);
+        let tick_size = dec!(0.01);
+        let decimals = tick_size.scale(); // 2
+
+        let uncapped_scale = decimals + LOT_SIZE_SCALE; // 4
+        let capped_scale = uncapped_scale.min(4);
+        assert_eq!(
+            uncapped_scale, capped_scale,
+            "cap must be no-op on tick=0.01 (4dp ≤ 4)"
+        );
+        // Both produce identical results.
+        let uncapped = (raw_amount / price).trunc_with_scale(uncapped_scale);
+        let capped = (raw_amount / price).trunc_with_scale(capped_scale);
+        assert_eq!(uncapped, capped);
     }
 }
