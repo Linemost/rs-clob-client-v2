@@ -333,6 +333,19 @@ where
     }
 }
 
+pub fn empty_string_as_zero_hash<'de, D>(deserializer: D) -> std::result::Result<B256, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+
+    if s.trim().is_empty() {
+        Ok(B256::ZERO)
+    } else {
+        s.parse::<B256>().map_err(serde::de::Error::custom)
+    }
+}
+
 #[non_exhaustive]
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, Builder, PartialEq)]
@@ -388,6 +401,8 @@ pub struct TradeResponse {
     pub asset_id: U256,
     pub side: Side,
     pub size: Decimal,
+    /// `""` from the server (protocol-controlled fee) deserializes as zero.
+    #[serde(deserialize_with = "empty_string_as_zero")]
     pub fee_rate_bps: Decimal,
     pub price: Decimal,
     pub status: TradeStatusType,
@@ -402,7 +417,9 @@ pub struct TradeResponse {
     #[serde(default)]
     #[serde_as(deserialize_as = "DefaultOnNull")]
     pub maker_orders: Vec<MakerOrder>,
-    /// On-chain transaction hash.
+    /// On-chain transaction hash; `B256::ZERO` while the trade has none yet
+    /// (the server sends `""` before the settlement is submitted).
+    #[serde(default, deserialize_with = "empty_string_as_zero_hash")]
     pub transaction_hash: B256,
     pub trader_side: TraderSide,
     #[serde(default)]
@@ -518,6 +535,8 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
+    /// `""` from the server (protocol-controlled fee) deserializes as zero.
+    #[serde(deserialize_with = "empty_string_as_zero")]
     pub fee_rate_bps: Decimal,
     pub asset_id: U256,
     pub outcome: String,
@@ -898,4 +917,51 @@ pub struct RfqQuote {
     pub size_out: Decimal,
     /// Quoted price.
     pub price: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A V2 production trade row: the maker's `fee_rate_bps` is `""` (Polymarket
+    /// user-WS frame, 2026-10-10), and a pending trade's `transaction_hash` is `""`.
+    #[test]
+    fn trade_with_empty_fee_and_hash_deserializes() {
+        let row = serde_json::json!({
+            "id": "3115c042-496a-4c3f-a658-cf779b8cc54f",
+            "taker_order_id": "0x07dd66c726a91bd7a00cd082085eb1a4a840f1795765a3986a48395b7ee081f5",
+            "market": "0x86a3ec36dda7d59c2e8582637f78067956305134d27aa707cf0c58cbba147d4d",
+            "asset_id": "42349766303715933424346187738128552560896488734895976796067791038353378625351",
+            "side": "BUY",
+            "size": "3.979592",
+            "fee_rate_bps": "",
+            "price": "0.49",
+            "status": "MINED",
+            "match_time": "1791660660",
+            "last_update": "1791660663",
+            "outcome": "Down",
+            "bucket_index": 0,
+            "owner": "db1da718-a9f8-ddcd-18da-2c2c9d6cb749",
+            "maker_address": "0xD912131221D75B624963C928fa5BFd284c4775c3",
+            "maker_orders": [{
+                "order_id": "0x82f2c7921f9e3aec5d43a3ffa95fee0c2c954dcefd1637bd9ba369228ed4ee2a",
+                "owner": "88ca8eb2-dfd4-f0be-2d10-254053733561",
+                "maker_address": "0xf8AF03F1E68Ee7162DB8983f0d6dd0dC869854c6",
+                "matched_amount": "3.979592",
+                "price": "0.5100000201025633",
+                "fee_rate_bps": "",
+                "asset_id": "115567203651937252377108847858260490387636741576605859594556335920403185782319",
+                "outcome": "Up",
+                "side": "BUY"
+            }],
+            "transaction_hash": "",
+            "trader_side": "TAKER"
+        });
+
+        let trade: TradeResponse = serde_json::from_value(row).expect("trade row");
+
+        assert_eq!(trade.fee_rate_bps, Decimal::ZERO);
+        assert_eq!(trade.maker_orders[0].fee_rate_bps, Decimal::ZERO);
+        assert_eq!(trade.transaction_hash, B256::ZERO);
+    }
 }
