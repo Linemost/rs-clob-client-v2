@@ -314,9 +314,12 @@ pub struct PostOrderResponse {
     #[serde_as(deserialize_as = "DefaultOnNull")]
     #[serde(alias = "transactionsHashes")]
     pub transaction_hashes: Vec<B256>,
+    /// IDs of the trades the order made at placement. The server sends `tradeIDs`,
+    /// which the camelCase rename does not produce.
     #[builder(default)]
     #[serde(default)]
     #[serde_as(deserialize_as = "DefaultOnNull")]
+    #[serde(alias = "tradeIDs")]
     pub trade_ids: Vec<String>,
 }
 
@@ -963,5 +966,27 @@ mod tests {
         assert_eq!(trade.fee_rate_bps, Decimal::ZERO);
         assert_eq!(trade.maker_orders[0].fee_rate_bps, Decimal::ZERO);
         assert_eq!(trade.transaction_hash, B256::ZERO);
+    }
+
+    /// A matched FAK's POST response as the server sends it (Polymarket, 2026-10-13):
+    /// the trade ids under `tradeIDs`.
+    #[test]
+    fn post_order_response_reads_trade_ids_from_the_wire_key() {
+        let body = serde_json::json!({
+            "errorMsg": "",
+            "orderID": "0xd4263e4dfa4424c5aafd280321435d941065ce5f51d6a3ce8ebb5fd3a1b11787",
+            "takingAmount": "2.955881",
+            "makingAmount": "2.01",
+            "status": "matched",
+            "success": true,
+            "tradeIDs": ["4c2c5f51-603f-4627-8fe3-0bb06aa969e1"]
+        });
+
+        let response: PostOrderResponse = serde_json::from_value(body).expect("post response");
+
+        assert_eq!(
+            response.trade_ids,
+            vec!["4c2c5f51-603f-4627-8fe3-0bb06aa969e1"]
+        );
     }
 }
